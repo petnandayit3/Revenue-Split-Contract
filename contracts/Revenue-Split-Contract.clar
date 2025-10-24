@@ -7,13 +7,16 @@
 (define-constant ERR_INVALID_PARAMS (err u105))
 (define-constant ERR_CONSENSUS_REQUIRED (err u106))
 (define-constant ERR_ALREADY_SIGNED (err u107))
+(define-constant ERR_CONTRACT_PAUSED (err u108))
 (define-constant MAX_PARTICIPANTS u10)
 (define-constant MAX_PERCENTAGE u10000)
+(define-constant PAUSE_SIGNATURES_REQUIRED u3)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-contract-id uint u1)
 (define-data-var total-distributed uint u0)
 (define-data-var pending-updates uint u0)
+(define-data-var next-pause-request-id uint u1)
 
 (define-map revenue-contracts uint {
   name: (string-ascii 64),
@@ -22,7 +25,8 @@
   total-revenue: uint,
   is-active: bool,
   last-distribution: uint,
-  update-proposal: (optional uint)
+  update-proposal: (optional uint),
+  is-paused: bool
 })
 
 (define-map contract-participants { contract-id: uint, participant: principal } {
@@ -47,6 +51,17 @@
 
 (define-map new-participant-data { proposal-id: uint, participant: principal } uint)
 
+(define-map pause-requests uint {
+  contract-id: uint,
+  requested-by: principal,
+  pause: bool,
+  signatures-count: uint,
+  is-executed: bool,
+  created-at: uint
+})
+
+(define-map pause-signatures { request-id: uint, signer: principal } bool)
+
 (define-public (create-revenue-contract (name (string-ascii 64)) (participants (list 10 { participant: principal, percentage: uint })))
   (let (
     (contract-id (var-get next-contract-id))
@@ -64,7 +79,8 @@
       total-revenue: u0,
       is-active: true,
       last-distribution: stacks-block-height,
-      update-proposal: none
+      update-proposal: none,
+      is-paused: false
     })
     
     (fold add-participant-to-contract participants contract-id)
@@ -79,6 +95,7 @@
     (amount (stx-get-balance tx-sender))
   )
     (asserts! (get is-active contract-info) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-paused contract-info)) ERR_CONTRACT_PAUSED)
     (asserts! (> amount u0) ERR_INVALID_PARAMS)
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -97,6 +114,7 @@
     (available-balance (as-contract (stx-get-balance tx-sender)))
   )
     (asserts! (get is-active contract-info) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-paused contract-info)) ERR_CONTRACT_PAUSED)
     (asserts! (> available-balance u0) ERR_INSUFFICIENT_BALANCE)
     
     (let (
@@ -226,6 +244,70 @@
   (- (var-get next-contract-id) u1)
 )
 
+(define-read-only (get-pause-request-info (request-id uint))
+  (map-get? pause-requests request-id)
+)
+
+(define-read-only (has-signed-pause-request (request-id uint) (signer principal))
+  (default-to false (map-get? pause-signatures { request-id: request-id, signer: signer }))
+)
+
+(define-public (request-emergency-pause (contract-id uint) (pause bool))
+  (let (
+    (contract-info (unwrap! (map-get? revenue-contracts contract-id) ERR_NOT_FOUND))
+    (participant-info (unwrap! (map-get? contract-participants { contract-id: contract-id, participant: tx-sender }) ERR_UNAUTHORIZED))
+    (request-id (var-get next-pause-request-id))
+  )
+    (asserts! (get is-active contract-info) ERR_UNAUTHORIZED)
+    (asserts! (get is-active participant-info) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq pause (get is-paused contract-info))) ERR_INVALID_PARAMS)
+    
+    (map-set pause-requests request-id {
+      contract-id: contract-id,
+      requested-by: tx-sender,
+      pause: pause,
+      signatures-count: u1,
+      is-executed: false,
+      created-at: stacks-block-height
+    })
+    
+    (map-set pause-signatures { request-id: request-id, signer: tx-sender } true)
+    (var-set next-pause-request-id (+ request-id u1))
+    
+    (if (>= u1 PAUSE_SIGNATURES_REQUIRED)
+      (begin (execute-pause-request request-id) (ok request-id))
+      (ok request-id)
+    )
+  )
+)
+
+(define-public (sign-pause-request (request-id uint))
+  (let (
+    (request-info (unwrap! (map-get? pause-requests request-id) ERR_NOT_FOUND))
+    (contract-id (get contract-id request-info))
+    (participant-info (unwrap! (map-get? contract-participants { contract-id: contract-id, participant: tx-sender }) ERR_UNAUTHORIZED))
+    (already-signed (default-to false (map-get? pause-signatures { request-id: request-id, signer: tx-sender })))
+  )
+    (asserts! (get is-active participant-info) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-executed request-info)) ERR_UNAUTHORIZED)
+    (asserts! (not already-signed) ERR_ALREADY_SIGNED)
+    
+    (let (
+      (new-signature-count (+ (get signatures-count request-info) u1))
+    )
+      (map-set pause-signatures { request-id: request-id, signer: tx-sender } true)
+      (map-set pause-requests request-id
+        (merge request-info { signatures-count: new-signature-count })
+      )
+      
+      (if (>= new-signature-count PAUSE_SIGNATURES_REQUIRED)
+        (begin (execute-pause-request request-id) (ok true))
+        (ok true)
+      )
+    )
+  )
+)
+
 (define-private (get-percentage (participant-data { participant: principal, percentage: uint }))
   (get percentage participant-data)
 )
@@ -280,5 +362,23 @@
       (merge proposal-info { is-executed: true })
     )
     (ok true)
+  )
+)
+
+(define-private (execute-pause-request (request-id uint))
+  (let (
+    (request-info (unwrap-panic (map-get? pause-requests request-id)))
+    (contract-id (get contract-id request-info))
+    (contract-info (unwrap-panic (map-get? revenue-contracts contract-id)))
+  )
+    (map-set pause-requests request-id
+      (merge request-info { is-executed: true })
+    )
+    
+    (map-set revenue-contracts contract-id
+      (merge contract-info { is-paused: (get pause request-info) })
+    )
+    
+    true
   )
 )
