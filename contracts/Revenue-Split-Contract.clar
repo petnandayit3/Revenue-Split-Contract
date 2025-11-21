@@ -8,9 +8,11 @@
 (define-constant ERR_CONSENSUS_REQUIRED (err u106))
 (define-constant ERR_ALREADY_SIGNED (err u107))
 (define-constant ERR_CONTRACT_PAUSED (err u108))
+(define-constant ERR_VESTING_LOCKED (err u109))
 (define-constant MAX_PARTICIPANTS u10)
 (define-constant MAX_PERCENTAGE u10000)
 (define-constant PAUSE_SIGNATURES_REQUIRED u3)
+(define-constant BLOCKS_PER_MONTH u4320)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-contract-id uint u1)
@@ -61,6 +63,14 @@
 })
 
 (define-map pause-signatures { request-id: uint, signer: principal } bool)
+
+(define-map vesting-schedules { contract-id: uint, participant: principal } {
+  cliff-blocks: uint,
+  vesting-blocks: uint,
+  start-block: uint,
+  total-allocation: uint,
+  released-amount: uint
+})
 
 (define-public (create-revenue-contract (name (string-ascii 64)) (participants (list 10 { participant: principal, percentage: uint })))
   (let (
@@ -380,5 +390,89 @@
     )
     
     true
+  )
+)
+
+(define-public (setup-vesting (contract-id uint) (participant principal) (cliff-months uint) (vesting-months uint))
+  (let (
+    (contract-info (unwrap! (map-get? revenue-contracts contract-id) ERR_NOT_FOUND))
+    (participant-info (unwrap! (map-get? contract-participants { contract-id: contract-id, participant: participant }) ERR_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get created-by contract-info)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active contract-info) ERR_UNAUTHORIZED)
+    (asserts! (> vesting-months u0) ERR_INVALID_PARAMS)
+    
+    (map-set vesting-schedules { contract-id: contract-id, participant: participant } {
+      cliff-blocks: (* cliff-months BLOCKS_PER_MONTH),
+      vesting-blocks: (* vesting-months BLOCKS_PER_MONTH),
+      start-block: stacks-block-height,
+      total-allocation: u0,
+      released-amount: u0
+    })
+    (ok true)
+  )
+)
+
+(define-public (withdraw-vested-earnings (contract-id uint))
+  (let (
+    (vesting-info (unwrap! (map-get? vesting-schedules { contract-id: contract-id, participant: tx-sender }) ERR_NOT_FOUND))
+    (participant-balance (default-to u0 (map-get? participant-balances { contract-id: contract-id, participant: tx-sender })))
+    (blocks-elapsed (- stacks-block-height (get start-block vesting-info)))
+    (cliff-blocks (get cliff-blocks vesting-info))
+    (vesting-blocks (get vesting-blocks vesting-info))
+  )
+    (asserts! (>= blocks-elapsed cliff-blocks) ERR_VESTING_LOCKED)
+    
+    (let (
+      (total-vested-amount (if (>= blocks-elapsed (+ cliff-blocks vesting-blocks))
+        participant-balance
+        (/ (* participant-balance (- blocks-elapsed cliff-blocks)) vesting-blocks)
+      ))
+      (released-amount (get released-amount vesting-info))
+      (available-amount (if (> total-vested-amount released-amount)
+        (- total-vested-amount released-amount)
+        u0
+      ))
+    )
+      (asserts! (> available-amount u0) ERR_INSUFFICIENT_BALANCE)
+      
+      (map-set vesting-schedules { contract-id: contract-id, participant: tx-sender }
+        (merge vesting-info { 
+          released-amount: (+ released-amount available-amount),
+          total-allocation: participant-balance
+        })
+      )
+      
+      (map-set participant-balances { contract-id: contract-id, participant: tx-sender } 
+        (- participant-balance available-amount)
+      )
+      
+      (as-contract (stx-transfer? available-amount tx-sender tx-sender))
+    )
+  )
+)
+
+(define-read-only (get-vesting-info (contract-id uint) (participant principal))
+  (map-get? vesting-schedules { contract-id: contract-id, participant: participant })
+)
+
+(define-read-only (calculate-vested-amount (contract-id uint) (participant principal))
+  (match (map-get? vesting-schedules { contract-id: contract-id, participant: participant })
+    vesting-info
+    (let (
+      (participant-balance (default-to u0 (map-get? participant-balances { contract-id: contract-id, participant: participant })))
+      (blocks-elapsed (- stacks-block-height (get start-block vesting-info)))
+      (cliff-blocks (get cliff-blocks vesting-info))
+      (vesting-blocks (get vesting-blocks vesting-info))
+    )
+      (if (< blocks-elapsed cliff-blocks)
+        (ok u0)
+        (if (>= blocks-elapsed (+ cliff-blocks vesting-blocks))
+          (ok participant-balance)
+          (ok (/ (* participant-balance (- blocks-elapsed cliff-blocks)) vesting-blocks))
+        )
+      )
+    )
+    ERR_NOT_FOUND
   )
 )
